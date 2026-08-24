@@ -2250,4 +2250,92 @@ describe("MessageBuilder outdated-read rewrite batching (prefix-cache stability)
 		expect(serializedBlockAt(result, 2)).not.toContain("outdated");
 		expect(serializedBlockAt(result, 2)).toContain("export const x = 1;");
 	});
+
+	it("does not mark a ranged read outdated when a full-file read preceded it", () => {
+		const builder = new MessageBuilder({ minOutdatedRewriteBytes: 0 });
+		const path = "c:\\projects\\name\\src\\folder\\file.ts";
+		const messages: Message[] = [
+			{ role: "user", content: "task" },
+			// Full-file read establishes a full-content owner for the path.
+			readToolUse("full1", path),
+			readToolResult("full1", "FULL CONTENT", path),
+			// A later ranged read is the latest view of its range and must not
+			// be rewritten as outdated just because a full read happened first.
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "range1",
+						name: "read_files",
+						input: { files: [{ path, start_line: 338, end_line: 350 }] },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "range1",
+						name: "read_files",
+						content: JSON.stringify([
+							{
+								query: `${path}:338-350`,
+								result: "RANGE CONTENT",
+								success: true,
+							},
+						]),
+					},
+				],
+			},
+		];
+
+		const result = builder.buildForApi(messages);
+		const serialized = serializedBlockAt(result, 4);
+		expect(serialized).toContain("RANGE CONTENT");
+		expect(serialized).not.toContain("[outdated");
+	});
+
+	it("still marks a ranged read outdated when a full-file read follows it", () => {
+		const builder = new MessageBuilder({ minOutdatedRewriteBytes: 0 });
+		const path = "src/a.ts";
+		const messages: Message[] = [
+			{ role: "user", content: "task" },
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "tool_use",
+						id: "range1",
+						name: "read_files",
+						input: { files: [{ path, start_line: 338, end_line: 350 }] },
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "range1",
+						name: "read_files",
+						content: JSON.stringify([
+							{
+								query: `${path}:338-350`,
+								result: "RANGE CONTENT",
+								success: true,
+							},
+						]),
+					},
+				],
+			},
+			// A full-file read after the ranged read supersedes it.
+			readToolUse("full1", path),
+			readToolResult("full1", "FULL CONTENT", path),
+		];
+
+		const result = builder.buildForApi(messages);
+		expect(serializedBlockAt(result, 2)).toContain("[outdated");
+	});
 });

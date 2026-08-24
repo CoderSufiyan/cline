@@ -113,11 +113,17 @@ export class MessageBuilder {
 		string,
 		ReadLocator[]
 	>();
-	private readonly latestReadToolUseByLocatorCache = new Map<string, string>();
-	private readonly latestFullContentOwnerByPathCache = new Map<
+	// Maps a read tool_use_id to its position in the (monotonic) scan order of
+	// reindex. Positions let us tell "this read came before the full-content
+	// read" from "this read came after it" — a ranged read that follows a full
+	// read is the latest view of its range and must not be marked outdated.
+	private readonly readPositionById = new Map<string, number>();
+	private readonly latestReadPositionByLocatorCache = new Map<string, number>();
+	private readonly latestFullContentPositionByPathCache = new Map<
 		string,
-		string
+		number
 	>();
+	private readPositionCounter = 0;
 	private readResultLocatorCache = new WeakMap<object, ReadLocator[]>();
 	private readonly maxToolResultChars: number;
 	private readonly maxFileContentChars: number;
@@ -293,9 +299,9 @@ export class MessageBuilder {
 			for (let j = 0; j < message.content.length; j++) {
 				const block = message.content[j];
 				if (block.type === "file") {
-					this.latestFullContentOwnerByPathCache.set(
+					this.latestFullContentPositionByPathCache.set(
 						block.path,
-						`file:${i}:${j}`,
+						this.nextReadPosition(),
 					);
 				} else if (block.type === "tool_use") {
 					const normalizedName = block.name.toLowerCase();
@@ -311,16 +317,18 @@ export class MessageBuilder {
 					if (!this.isReadTool(toolName) || block.is_error === true) {
 						continue;
 					}
+					const position = this.nextReadPosition();
+					this.readPositionById.set(block.tool_use_id, position);
 					const locators = this.getReadLocators(block);
 					for (const locator of locators) {
-						this.latestReadToolUseByLocatorCache.set(
+						this.latestReadPositionByLocatorCache.set(
 							this.toReadLocatorKey(locator),
-							block.tool_use_id,
+							position,
 						);
 						if (this.isFullFileRead(locator)) {
-							this.latestFullContentOwnerByPathCache.set(
+							this.latestFullContentPositionByPathCache.set(
 								locator.path,
-								block.tool_use_id,
+								position,
 							);
 						}
 					}
@@ -715,9 +723,20 @@ export class MessageBuilder {
 		this.indexedTailRef = undefined;
 		this.toolNameByIdCache.clear();
 		this.readLocatorsByToolUseIdCache.clear();
-		this.latestReadToolUseByLocatorCache.clear();
-		this.latestFullContentOwnerByPathCache.clear();
+		this.readPositionById.clear();
+		this.latestReadPositionByLocatorCache.clear();
+		this.latestFullContentPositionByPathCache.clear();
 		this.readResultLocatorCache = new WeakMap<object, ReadLocator[]>();
+	}
+
+	/**
+	 * Monotonic position used to order read tool results (and file
+	 * attachments) during a reindex. `resetIndexes` zeroes the counter so a
+	 * fresh index restarts at 1.
+	 */
+	private nextReadPosition(): number {
+		this.readPositionCounter += 1;
+		return this.readPositionCounter;
 	}
 
 	private getReadLocators(block: ToolResultContent): ReadLocator[] {
@@ -898,15 +917,24 @@ export class MessageBuilder {
 		locator: ReadLocator,
 		toolUseId: string,
 	): boolean {
-		const fullOwner = this.latestFullContentOwnerByPathCache.get(locator.path);
-		if (fullOwner && fullOwner !== toolUseId) {
-			return true;
+		const myPosition = this.readPositionById.get(toolUseId);
+		// A full-content read (or user file attachment) only supersedes reads
+		// that came BEFORE it. A ranged read that follows a full read is the
+		// latest view of its range and must not be rewritten as outdated.
+		if (myPosition !== undefined) {
+			const fullPosition = this.latestFullContentPositionByPathCache.get(
+				locator.path,
+			);
+			if (fullPosition !== undefined && fullPosition > myPosition) {
+				return true;
+			}
+			return (
+				this.latestReadPositionByLocatorCache.get(
+					this.toReadLocatorKey(locator),
+				) !== myPosition
+			);
 		}
-		return (
-			this.latestReadToolUseByLocatorCache.get(
-				this.toReadLocatorKey(locator),
-			) !== toolUseId
-		);
+		return true;
 	}
 
 	private replaceOutdatedReadContent(
